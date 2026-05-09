@@ -74,12 +74,18 @@ pub struct HarnessConfig {
         deserialize_with = "deserialize_harness"
     )]
     pub harness_type: Harness,
+    /// The model to use with this harness. None means use the harness default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 impl HarnessConfig {
     /// Builds a harness config from just the harness type.
     pub fn from_harness_type(harness_type: Harness) -> Self {
-        Self { harness_type }
+        Self {
+            harness_type,
+            model_id: None,
+        }
     }
 }
 
@@ -271,6 +277,16 @@ pub struct RunExecution<'a> {
     pub is_sandbox_running: bool,
 }
 
+impl RunExecution<'_> {
+    pub fn has_joinable_session(&self) -> bool {
+        self.session_id.is_some() || self.session_link.is_some()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.is_sandbox_running && self.has_joinable_session()
+    }
+}
+
 /// Represents a single attachment input from the client (e.g., file upload)
 #[derive(Clone, Debug, Serialize)]
 pub struct AttachmentInput {
@@ -304,6 +320,35 @@ impl AmbientAgentTask {
             request_usage: self.request_usage.as_ref(),
             is_sandbox_running: self.is_sandbox_running,
         }
+    }
+
+    pub fn active_execution_session_id(&self) -> Option<&str> {
+        let execution = self.active_run_execution();
+        if self.state == AmbientAgentTaskState::InProgress && execution.is_active() {
+            execution.session_id
+        } else {
+            None
+        }
+    }
+
+    pub fn active_execution_conversation_id(&self) -> Option<&str> {
+        if self.has_active_execution() {
+            self.conversation_id()
+        } else {
+            None
+        }
+    }
+
+    pub fn has_active_execution(&self) -> bool {
+        self.state == AmbientAgentTaskState::InProgress && self.active_run_execution().is_active()
+    }
+
+    pub fn is_terminal_run_state(&self) -> bool {
+        self.state.is_terminal()
+    }
+
+    pub fn can_submit_cloud_followup(&self) -> bool {
+        self.is_terminal_run_state() && !self.has_active_execution()
     }
 
     /// Total credits used (inference + compute).
