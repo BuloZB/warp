@@ -352,9 +352,6 @@ pub enum FeatureFlag {
     /// Enables new Search Codebase UI
     SearchCodebaseUI,
 
-    /// Enables return changed lines on apply diff result
-    ChangedLinesOnlyApplyDiffResult,
-
     /// Enables us to render linked code blocks
     LinkedCodeBlocks,
 
@@ -722,6 +719,13 @@ pub enum FeatureFlag {
     /// and switches the view to its transcript.
     OrchestrationViewerPillBar,
 
+    /// Replaces `OrchestrationViewerModel`'s REST polling loop with an SSE-driven
+    /// `ancestor_run_id` stream consumed via `OrchestrationEventStreamer`'s new
+    /// viewer-mode entry. Off by default; flipping it on activates the
+    /// per-orchestrator viewer-mode consumer and the broadcast `ChildSpawned`
+    /// / `ChildStatusChanged` events. See `specs/orch-viewer-polling/TECH.md`.
+    OrchestrationViewerStreamer,
+
     /// Shows a pending user query indicator during summarization when a follow-up
     /// prompt is queued via `/fork-and-compact` or `/compact-and`.
     PendingUserQueryIndicator,
@@ -729,6 +733,8 @@ pub enum FeatureFlag {
     /// Gates the `/queue` slash command, which lets users queue a follow-up prompt
     /// while the agent is mid-response.
     QueueSlashCommand,
+    /// Extends queued prompts to Cloud Mode setup and follow-up draining.
+    QueuedPromptsV2,
 
     /// Enables an agent tool for the CLI subagent to explicitly transfer command control to the
     /// user.
@@ -876,6 +882,9 @@ pub enum FeatureFlag {
 
     /// Enables the code review view for remote sessions.
     RemoteCodeReview,
+
+    /// Gates the Grouped Tabs feature.
+    GroupedTabs,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -923,7 +932,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::SummarizationViaMessageReplacement,
     FeatureFlag::LocalComputerUse,
     FeatureFlag::OzLaunchModal,
-    FeatureFlag::QueueSlashCommand,
     // These are enabled via 100% experiment on prod warp-server,
     // but we need to enable here for dogfood builds.
     FeatureFlag::CrossRepoContext,
@@ -938,16 +946,16 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::LocalDockerSandbox,
     #[cfg(not(windows))]
     FeatureFlag::SshRemoteServer,
-    FeatureFlag::DragTabsToWindows,
     FeatureFlag::RemoteCodebaseIndexing,
+    FeatureFlag::GroupedTabs,
+    FeatureFlag::AsyncFind,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Warp).
 /// All PREVIEW_FLAGS are also automatically added to dogfood builds (WarpDev).
 pub const PREVIEW_FLAGS: &[FeatureFlag] = &[
-    FeatureFlag::BlocklistMarkdownTableRendering,
-    FeatureFlag::MarkdownTables,
-    FeatureFlag::GitOperationsInCodeReview,
+    #[cfg(target_os = "macos")]
+    FeatureFlag::DragTabsToWindows,
 ];
 
 /// Features enabled for all release builds (i.e.: everything but WarpLocal).
