@@ -79,6 +79,7 @@ fn start_agent_copy_uses_remote_labels_for_remote_children() {
         harness_type: String::new(),
         title: String::new(),
         auth_secret_name: None,
+        agent_identity_uid: None,
     };
 
     assert_eq!(start_agent_success_suffix(&execution_mode), " remotely.");
@@ -262,13 +263,11 @@ fn participant_for_agent_id_uses_pill_style_child_agent_avatar() {
 fn participant_for_restored_child_run_id_resolves_to_agent_name() {
     use chrono::Utc;
     use uuid::Uuid;
-    use warp_core::features::FeatureFlag;
 
     use crate::persistence::model::{
         AgentConversation, AgentConversationData, AgentConversationRecord,
     };
 
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
     App::test((), |app| async move {
         let parent_id = AIConversationId::new();
         let child_id = AIConversationId::new();
@@ -304,10 +303,12 @@ fn participant_for_restored_child_run_id_resolves_to_agent_name() {
                 })
                 .expect("child conversation data should serialize"),
                 last_modified_at: now,
+                summary: None,
             },
             tasks: vec![warp_multi_agent_api::Task {
                 id: format!("task-{child_id}"),
                 messages: vec![warp_multi_agent_api::Message {
+                    fetched_memories: vec![],
                     id: "child-msg".to_string(),
                     task_id: format!("task-{child_id}"),
                     server_message_data: String::new(),
@@ -356,10 +357,12 @@ fn participant_for_restored_child_run_id_resolves_to_agent_name() {
                 })
                 .expect("parent conversation data should serialize"),
                 last_modified_at: now - chrono::Duration::seconds(1),
+                summary: None,
             },
             tasks: vec![warp_multi_agent_api::Task {
                 id: format!("task-{parent_id}"),
                 messages: vec![warp_multi_agent_api::Message {
+                    fetched_memories: vec![],
                     id: "parent-msg".to_string(),
                     task_id: format!("task-{parent_id}"),
                     server_message_data: String::new(),
@@ -383,7 +386,7 @@ fn participant_for_restored_child_run_id_resolves_to_agent_name() {
             }],
         };
 
-        app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[child, parent]));
+        app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[child, parent]));
 
         // Before Fix C the child would not be loaded into
         // `conversations_by_id`, so `participant_for_agent_id` would return

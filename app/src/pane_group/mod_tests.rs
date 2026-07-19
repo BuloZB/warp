@@ -15,12 +15,16 @@ use session_sharing_protocol::common::SessionId;
 use shared_session::permissions_manager::SessionPermissionsManager;
 use uuid::Uuid;
 use warp_core::features::FeatureFlag;
+use warp_server_client::iap::IapManager;
 use warpui::platform::{WindowBounds, WindowStyle};
 use warpui::windowing::state::ApplicationStage;
 use warpui::windowing::WindowManager;
 use warpui::{App, ModelHandle};
 use watcher::HomeDirectoryWatcher;
 
+use super::child_agent::hydration::{
+    decide_remote_child_hydration_action, RemoteChildHydrationAction,
+};
 use super::child_agent::{
     create_hidden_child_agent_conversation, HiddenChildAgentConversationRequest,
     HiddenChildAgentTaskContext,
@@ -35,7 +39,8 @@ use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::ambient_agents::github_auth_notifier::GitHubAuthNotifier;
 use crate::ai::ambient_agents::task::TaskPrincipalInfo;
 use crate::ai::ambient_agents::{
-    AgentSource, AmbientAgentTask, AmbientAgentTaskId, AmbientAgentTaskState,
+    AgentSource, AmbientAgentLiveSessionState, AmbientAgentTask, AmbientAgentTaskId,
+    AmbientAgentTaskState,
 };
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::history_model::CloudConversationData;
@@ -70,7 +75,6 @@ use crate::resource_center::TipsCompleted;
 use crate::search::files::model::FileSearchModel;
 use crate::server::cloud_objects::listener::Listener;
 use crate::server::cloud_objects::update_manager::UpdateManager;
-use crate::server::iap::IapManager;
 use crate::server::ids::ServerId;
 use crate::server::server_api::ServerApiProvider;
 use crate::server::sync_queue::SyncQueue;
@@ -111,7 +115,14 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(|_ctx| ServerApiProvider::new_for_test());
     // Disabled (`None`) IapManager so shared-session viewer code that reads the
     // singleton doesn't panic in tests; it is an inert no-op.
-    app.add_singleton_model(|ctx| IapManager::new(None, ctx));
+    app.add_singleton_model(|ctx| {
+        IapManager::new(
+            None,
+            Box::new(|_| futures::FutureExt::boxed(futures::future::ready(None::<String>))),
+            None,
+            ctx,
+        )
+    });
     app.add_singleton_model(|ctx| ChangelogModel::new(ServerApiProvider::as_ref(ctx).get()));
     app.add_singleton_model(|_| AuthStateProvider::new_for_test());
     app.add_singleton_model(AppTelemetryContextProvider::new_context_provider);
@@ -166,9 +177,7 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(OrchestrationEventService::new);
     app.add_singleton_model(LocalAgentTaskSyncModel::new);
-    if FeatureFlag::OrchestrationV2.is_enabled() {
-        app.add_singleton_model(OrchestrationEventStreamer::new);
-    }
+    app.add_singleton_model(OrchestrationEventStreamer::new);
     app.add_singleton_model(|_| ActiveAgentViewsModel::new());
     app.add_singleton_model(crate::ai::blocklist::BlocklistAIPermissions::new);
     app.add_singleton_model(AgentNotificationsModel::new);
@@ -187,7 +196,7 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(RepoMetadataModel::new);
     app.add_singleton_model(SkillManager::new);
     app.add_singleton_model(FileSearchModel::new);
-    app.add_singleton_model(|_| crate::code_review::git_status_update::GitStatusUpdateModel::new());
+    app.add_singleton_model(|_| crate::code_review::git_repo_model::GitRepoModels::new());
     app.add_singleton_model(RepoOutlines::new_for_test);
     crate::terminal::available_shells::register(app);
     app.update(experiments::init);
@@ -198,7 +207,7 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(|ctx| PersistedWorkspace::new(vec![], HashMap::new(), None, ctx));
     app.add_singleton_model(|_| ProjectContextModel::default());
     app.add_singleton_model(|ctx| crate::ai::agent_tips::AITipModel::new_for_agent_tips(ctx));
-    app.add_singleton_model(|_| RestoredAgentConversations::new(vec![]));
+    app.add_singleton_model(|_| RestoredAgentConversations::new_seeded(vec![]));
     app.add_singleton_model(OneTimeModalModel::new);
     app.add_singleton_model(|_| WorkspaceRegistry::new());
     app.add_singleton_model(UndoCloseStack::new);
@@ -344,6 +353,7 @@ fn test_server_conversation_metadata(
             credits_spent_for_last_block: None,
             token_usage: vec![],
             tool_usage_metadata: Default::default(),
+            context_window_segments: Vec::new(),
         },
         metadata: mock_server_metadata(),
         creator: None,
@@ -390,6 +400,7 @@ fn persisted_remote_child_conversation(
             })
             .expect("conversation data should serialize"),
             last_modified_at: Utc::now().naive_utc(),
+            summary: None,
         },
         tasks: vec![warp_multi_agent_api::Task {
             id: Uuid::new_v4().to_string(),
@@ -838,8 +849,6 @@ fn test_insert_hidden_ambient_child_agent_pane_suppresses_details_auto_open() {
 }
 #[test]
 fn test_hidden_child_creation_applies_ambient_task_id_to_controller() {
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
-
     App::test((), |mut app| async move {
         initialize_app(&mut app);
         let pane_group = mock_pane_group(&mut app, Default::default());
@@ -883,8 +892,6 @@ fn test_hidden_child_creation_applies_ambient_task_id_to_controller() {
 
 #[test]
 fn test_restored_hidden_child_pane_reapplies_ambient_task_id_to_controller() {
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
-
     App::test((), |mut app| async move {
         initialize_app(&mut app);
         let pane_group = mock_pane_group(&mut app, Default::default());
@@ -917,8 +924,6 @@ fn test_restored_hidden_child_pane_reapplies_ambient_task_id_to_controller() {
 
 #[test]
 fn test_restored_remote_hidden_child_pane_enters_existing_ambient_session() {
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
-
     App::test((), |mut app| async move {
         initialize_app(&mut app);
         let pane_group = mock_pane_group(&mut app, Default::default());
@@ -998,8 +1003,6 @@ fn test_restored_remote_hidden_child_pane_enters_existing_ambient_session() {
 /// never produce a worse state than the pre-Fix-B fallback.
 #[test]
 fn test_restored_remote_hidden_child_pane_fallback_when_task_data_unavailable() {
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
-
     App::test((), |mut app| async move {
         initialize_app(&mut app);
         let pane_group = mock_pane_group(&mut app, Default::default());
@@ -1080,7 +1083,7 @@ fn test_restored_remote_hidden_child_pane_fallback_when_task_data_unavailable() 
 ///   * the hidden child pane must materialize in `child_agent_panes` keyed
 ///     by the placeholder conversation id after parent fullscreen.
 ///
-/// The disk-load construction path (`BlocklistAIHistoryModel::new(_, &conversations)`
+/// The disk-load construction path (`BlocklistAIHistoryModel::new(_, _, &conversations)`
 /// invoking `initialize_historical_conversations`) is covered by
 /// `test_initialize_historical_conversations_eagerly_hydrates_orchestration_children`
 /// in `app/src/ai/blocklist/history_model_tests.rs`. `agent_display_name_from_id`
@@ -1095,7 +1098,6 @@ fn test_restored_remote_hidden_child_pane_fallback_when_task_data_unavailable() 
 #[test]
 fn test_pane_group_restore_loop_keeps_orchestration_topology_and_materializes_child_pane() {
     let _agent_view = FeatureFlag::AgentView.override_enabled(true);
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1249,8 +1251,6 @@ fn test_pane_group_restore_loop_keeps_orchestration_topology_and_materializes_ch
 
 #[test]
 fn test_create_missing_child_agent_panes_restores_remote_child_from_history_model() {
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
-
     App::test((), |mut app| async move {
         initialize_app(&mut app);
         let pane_group = mock_pane_group(&mut app, Default::default());
@@ -1271,13 +1271,14 @@ fn test_create_missing_child_agent_panes_restores_remote_child_from_history_mode
                     .set_parent_for_conversation(child_conversation_id, parent_conversation_id);
             });
             RestoredAgentConversations::handle(ctx).update(ctx, |store, _| {
-                *store =
-                    RestoredAgentConversations::new(vec![persisted_remote_child_conversation(
+                *store = RestoredAgentConversations::new_seeded(vec![
+                    persisted_remote_child_conversation(
                         child_conversation_id,
                         Some(parent_conversation_id),
                         None,
                         task_id,
-                    )]);
+                    ),
+                ]);
             });
 
             panes.restore_missing_child_agent_panes_for_parent(
@@ -1508,7 +1509,6 @@ fn test_entering_parent_agent_view_lazily_restores_hidden_child_pane() {
 #[test]
 fn test_entering_remote_parent_agent_view_lazily_restores_local_hidden_child_pane() {
     let _agent_view = FeatureFlag::AgentView.override_enabled(true);
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1589,7 +1589,6 @@ fn test_entering_remote_parent_agent_view_lazily_restores_local_hidden_child_pan
 #[test]
 fn test_entering_remote_parent_agent_view_lazily_restores_remote_hidden_child_pane() {
     let _agent_view = FeatureFlag::AgentView.override_enabled(true);
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1875,7 +1874,6 @@ fn test_ensure_hidden_child_agent_pane_materializes_missing_child_pane() {
 fn test_ensure_hidden_child_agent_pane_materializes_restored_remote_child_linked_by_parent_agent_id(
 ) {
     let _agent_view = FeatureFlag::AgentView.override_enabled(true);
-    let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
@@ -1905,13 +1903,14 @@ fn test_ensure_hidden_child_agent_pane_materializes_restored_remote_child_linked
                     .set_parent_for_conversation(child_conversation_id, parent_conversation_id);
             });
             RestoredAgentConversations::handle(ctx).update(ctx, |store, _| {
-                *store =
-                    RestoredAgentConversations::new(vec![persisted_remote_child_conversation(
+                *store = RestoredAgentConversations::new_seeded(vec![
+                    persisted_remote_child_conversation(
                         child_conversation_id,
                         None,
                         Some(parent_run_id),
                         task_id,
-                    )]);
+                    ),
+                ]);
             });
 
             assert!(!panes.child_agent_panes.contains_key(&child_conversation_id));
@@ -2024,7 +2023,7 @@ fn test_ensure_hidden_child_agent_pane_skips_child_owned_by_another_pane_group()
             assert_eq!(panes.pane_count(), initial_pane_count);
             assert_eq!(
                 BlocklistAIHistoryModel::as_ref(ctx)
-                    .terminal_view_id_for_conversation(&child_conversation_id),
+                    .terminal_surface_id_for_conversation(&child_conversation_id),
                 Some(child_owner_terminal_view_id)
             );
         });
@@ -2070,7 +2069,7 @@ fn test_entering_parent_agent_view_skips_child_owned_by_another_pane_group() {
             assert_eq!(panes.pane_count(), initial_pane_count);
             assert_eq!(
                 BlocklistAIHistoryModel::as_ref(ctx)
-                    .terminal_view_id_for_conversation(&child_conversation_id),
+                    .terminal_surface_id_for_conversation(&child_conversation_id),
                 Some(child_owner_terminal_view_id)
             );
         });
@@ -2674,20 +2673,16 @@ fn test_stop_shared_session() {
         // Start the shared session.
         pane_group.update(&mut app, |pane_group, ctx| {
             let terminal_pane = pane_group.terminal_session_by_pane_index(0).unwrap();
-            terminal_pane
-                .terminal_manager(ctx)
-                .update(ctx, |terminal_manager, ctx| {
-                    let terminal_view = terminal_manager.view();
-                    terminal_view.update(ctx, |terminal_view, ctx| {
-                        terminal_view.attempt_to_share_session(
-                            SharedSessionScrollbackType::None,
-                            None,
-                            SharedSessionSource::user(None),
-                            false,
-                            ctx,
-                        );
-                    });
-                })
+            let terminal_view = terminal_pane.terminal_view(ctx);
+            terminal_view.update(ctx, |terminal_view, ctx| {
+                terminal_view.attempt_to_share_session(
+                    SharedSessionScrollbackType::None,
+                    None,
+                    SharedSessionSource::user(None),
+                    false,
+                    ctx,
+                );
+            });
         });
 
         // Wait for one tick of the event loop for the share to be started.
@@ -2708,15 +2703,10 @@ fn test_stop_shared_session() {
         // Stop the shared session.
         pane_group.update(&mut app, |pane_group, ctx| {
             let terminal_pane = pane_group.terminal_session_by_pane_index(0).unwrap();
-            terminal_pane
-                .terminal_manager(ctx)
-                .update(ctx, |terminal_manager, ctx| {
-                    let terminal_view = terminal_manager.view();
-                    terminal_view.update(ctx, |terminal_view, ctx| {
-                        terminal_view
-                            .stop_sharing_session(SharedSessionActionSource::PaneHeader, ctx);
-                    });
-                });
+            let terminal_view = terminal_pane.terminal_view(ctx);
+            terminal_view.update(ctx, |terminal_view, ctx| {
+                terminal_view.stop_sharing_session(SharedSessionActionSource::PaneHeader, ctx);
+            });
         });
 
         // Ensure the state is correct after stopping.
@@ -2726,7 +2716,7 @@ fn test_stop_shared_session() {
                 .terminal_manager(ctx)
                 .as_ref(ctx)
                 .as_any()
-                .downcast_ref::<TerminalManager>()
+                .downcast_ref::<TerminalManager<TerminalView>>()
                 .unwrap();
             let terminal_model = terminal_pane.terminal_manager(ctx).as_ref(ctx).model();
 
