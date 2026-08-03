@@ -32,6 +32,7 @@ fn make_request_with_skills(
             prompt: "do work".to_string(),
             title: "Child agent".to_string(),
             agent_identity_uid: String::new(),
+            model_id: String::new(),
         }],
         plan_id: String::new(),
         harness_auth_secret_name: None,
@@ -183,10 +184,12 @@ fn from_request_sanitizes_disabled_local_harness_to_oz() {
 
     assert_eq!(state.orchestration_config_state.harness_type, "oz");
     assert_eq!(state.orchestration_config_state.model_id, "");
-    assert!(state
-        .orchestration_config_state
-        .accept_disabled_reason()
-        .is_none());
+    assert!(
+        state
+            .orchestration_config_state
+            .accept_disabled_reason()
+            .is_none()
+    );
 }
 
 #[test]
@@ -322,12 +325,13 @@ fn to_request_round_trips_request_fields() {
 }
 
 mod format_terminal_state_tests {
-    use super::super::{format_terminal_state, StatusKind};
+    use super::super::{StatusKind, format_terminal_state};
     use super::*;
 
     fn launched(name: &str, agent_id: &str) -> RunAgentsAgentOutcome {
         RunAgentsAgentOutcome {
             name: name.to_string(),
+            resolved_model_id: String::new(),
             kind: RunAgentsAgentOutcomeKind::Launched {
                 agent_id: agent_id.to_string(),
             },
@@ -337,6 +341,7 @@ mod format_terminal_state_tests {
     fn failed(name: &str, error: &str) -> RunAgentsAgentOutcome {
         RunAgentsAgentOutcome {
             name: name.to_string(),
+            resolved_model_id: String::new(),
             kind: RunAgentsAgentOutcomeKind::Failed {
                 error: error.to_string(),
             },

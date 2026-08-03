@@ -8,7 +8,7 @@
 
 use ai::agent::action::RunAgentsExecutionMode;
 use pathfinder_color::ColorU;
-use pathfinder_geometry::vector::{vec2f, Vector2F};
+use pathfinder_geometry::vector::{Vector2F, vec2f};
 use warp_cli::agent::Harness;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::theme::Fill;
@@ -26,31 +26,32 @@ use warpui::{
     SingletonEntity, SizeConstraint, View, ViewContext, ViewHandle,
 };
 
+use crate::LLMPreferences;
 use crate::ai::blocklist::inline_action::host_picker::HostPicker;
 use crate::ai::execution_profiles::model_menu_items::available_model_menu_items;
 use crate::ai::harness_availability::HarnessAvailabilityModel;
 use crate::ai::harness_display;
+use crate::ai::orchestration::{
+    AUTH_SECRET_INHERIT_LABEL, OptionBadge, OptionFooter, OptionRow, OptionSnapshot,
+    OptionSourceStatus, api_key_snapshot, build_runner_snapshot, environment_snapshot,
+    harness_snapshot, host_snapshot, model_snapshot, persist_auth_secret_selection,
+};
 pub use crate::ai::orchestration::{
-    accept_disabled_reason_with_auth, empty_env_recommendation_message,
+    AuthSecretSelection, ORCHESTRATION_WARP_WORKER_HOST, OrchestrationConfigState,
+    OrchestrationEditState, accept_disabled_reason_with_auth, empty_env_recommendation_message,
     persist_environment_selection, persist_host_selection,
     resolve_auth_secret_selection_for_harness, resolve_default_environment_id,
-    resolve_default_host_slug, should_show_auth_secret_picker, AuthSecretSelection,
-    OrchestrationConfigState, OrchestrationEditState, ORCHESTRATION_WARP_WORKER_HOST,
-};
-use crate::ai::orchestration::{
-    api_key_snapshot, build_runner_snapshot, environment_snapshot, harness_snapshot, host_snapshot,
-    model_snapshot, persist_auth_secret_selection, OptionBadge, OptionFooter, OptionRow,
-    OptionSnapshot, OptionSourceStatus, AUTH_SECRET_INHERIT_LABEL,
+    resolve_default_host_slug, should_show_auth_secret_picker,
 };
 use crate::appearance::Appearance;
 use crate::menu::{MenuItem, MenuItemFields};
+use crate::server::experiments::{ServerExperiment, ServerExperiments};
 use crate::ui_components::blended_colors;
 use crate::ui_components::icons::Icon;
+use crate::view_components::FilterableDropdown;
 use crate::view_components::dropdown::{
     Dropdown, DropdownAction, DropdownItemAction, DropdownStyle,
 };
-use crate::view_components::FilterableDropdown;
-use crate::LLMPreferences;
 
 // ── Shared constants ────────────────────────────────────────────────
 
@@ -66,6 +67,17 @@ const ORCHESTRATION_SEGMENT_VERTICAL_PADDING: f32 = 4.;
 /// Label for the auth secret column.
 pub const AUTH_SECRET_COLUMN_LABEL: &str = "API key";
 const AUTH_SECRET_CREATE_NEW_LABEL: &str = "New API key…";
+
+/// Returns whether the client should expose the remote runner controls.
+///
+/// Both the feature flag and the server-side experiment test arm are required.
+/// Keeping this predicate here ensures the picker creation and rendering paths
+/// use the same gate.
+pub fn runner_controls_enabled(ctx: &AppContext) -> bool {
+    FeatureFlag::CloudAgentRunners.is_enabled()
+        && ServerExperiments::as_ref(ctx)
+            .is_experiment_enabled(&ServerExperiment::MacosRunnersExperiment)
+}
 
 // ── Action trait ────────────────────────────────────────────────────
 
@@ -96,7 +108,8 @@ pub struct OrchestrationPickerHandles<A: OrchestrationControlAction> {
     pub model_picker: Option<ViewHandle<FilterableDropdown<A>>>,
     pub harness_picker: Option<ViewHandle<Dropdown<A>>>,
     pub environment_picker: Option<ViewHandle<FilterableDropdown<A>>>,
-    /// Runner picker for the Cloud variant (gated on `CloudAgentRunners`).
+    /// Runner picker for the Cloud variant (gated on `CloudAgentRunners` and
+    /// the macOS runner experiment test arm).
     /// `None` until built; runners are fetched via `FactoryClient::get_runners`.
     pub runner_picker: Option<ViewHandle<FilterableDropdown<A>>>,
     pub host_picker: Option<ViewHandle<HostPicker>>,
@@ -569,7 +582,8 @@ pub fn populate_host_picker<V: View>(
             Some(OptionBadge::Recent) => recent_host = Some(row.id),
             Some(OptionBadge::Connected) => connected_hosts.push(row.id),
             // The unbadged "warp" row is built into the HostPicker itself.
-            None => {}
+            // Recommended is not applicable to host rows.
+            Some(OptionBadge::Recommended) | None => {}
         }
     }
     picker.update(ctx, |picker, picker_ctx| {
@@ -719,10 +733,11 @@ pub fn apply_harness_change<A: OrchestrationControlAction, V: View>(
     orchestration_edit_state.apply_harness_change(new_harness_type, fallback_base_model_id, ctx);
     let state = &orchestration_edit_state.orchestration_config_state;
     let is_local = !state.execution_mode.is_remote();
-    if is_local && state.harness_type != new_harness_type {
-        if let Some(handle) = &handles.harness_picker {
-            populate_harness_picker(handle, &state.harness_type, true, ctx);
-        }
+    if is_local
+        && state.harness_type != new_harness_type
+        && let Some(handle) = &handles.harness_picker
+    {
+        populate_harness_picker(handle, &state.harness_type, true, ctx);
     }
     if let Some(handle) = &handles.model_picker {
         populate_model_picker_for_harness(
@@ -1120,8 +1135,9 @@ pub fn render_picker_row<A: OrchestrationControlAction>(
     state: &OrchestrationConfigState,
     handles: &OrchestrationPickerHandles<A>,
     appearance: &Appearance,
+    show_runner_controls: bool,
 ) -> Box<dyn Element> {
-    render_picker_row_with_layout(state, handles, appearance, false)
+    render_picker_row_with_layout(state, handles, appearance, false, show_runner_controls)
 }
 
 /// Renders pickers vertically at full width when `vertical` is true,
@@ -1131,6 +1147,7 @@ pub fn render_picker_row_with_layout<A: OrchestrationControlAction>(
     handles: &OrchestrationPickerHandles<A>,
     appearance: &Appearance,
     vertical: bool,
+    show_runner_controls: bool,
 ) -> Box<dyn Element> {
     let is_remote = state.execution_mode.is_remote();
     let show_auth_picker = should_show_auth_secret_picker(state);
@@ -1183,7 +1200,7 @@ pub fn render_picker_row_with_layout<A: OrchestrationControlAction>(
                     .as_ref()
                     .map(|p| ChildView::new(p).finish()),
             );
-            if FeatureFlag::CloudAgentRunners.is_enabled() {
+            if show_runner_controls {
                 add(
                     &mut column,
                     "Runner",
@@ -1240,7 +1257,7 @@ pub fn render_picker_row_with_layout<A: OrchestrationControlAction>(
                     .as_ref()
                     .map(|p| ChildView::new(p).finish()),
             );
-            if FeatureFlag::CloudAgentRunners.is_enabled() {
+            if show_runner_controls {
                 add_picker(
                     &mut row,
                     "Runner",
@@ -1313,3 +1330,7 @@ pub fn render_validation_error(
     .with_margin_bottom(8.)
     .finish()
 }
+
+#[cfg(test)]
+#[path = "orchestration_controls_tests.rs"]
+mod tests;

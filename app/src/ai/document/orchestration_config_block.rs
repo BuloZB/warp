@@ -6,7 +6,6 @@ use ai::agent::action::RunAgentsExecutionMode;
 use ai::agent::orchestration_config::OrchestrationConfigStatus;
 use pathfinder_geometry::vector::vec2f;
 use warp_cli::agent::Harness;
-use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
 use warp_graphql::queries::get_runners::RunnerSortBy;
 use warpui::elements::{
@@ -22,7 +21,9 @@ use warpui::{
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
 };
 
+use crate::BlocklistAIHistoryModel;
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::blocklist::BlocklistAIHistoryEvent;
 use crate::ai::blocklist::inline_action::create_environment_modal::{
     CreateEnvironmentModal, CreateEnvironmentModalEvent,
 };
@@ -35,7 +36,6 @@ use crate::ai::blocklist::telemetry::{
     AgentProposedConfigEvent, BlocklistOrchestrationTelemetryEvent, OrchestrationApprovalStatus,
     OrchestrationExecutionModeKind, OrchestrationHarnessKind, PlanConfigApprovalToggledEvent,
 };
-use crate::ai::blocklist::BlocklistAIHistoryEvent;
 use crate::ai::connected_self_hosted_workers::{
     ConnectedSelfHostedWorkersEvent, ConnectedSelfHostedWorkersModel,
 };
@@ -45,10 +45,10 @@ use crate::ai::harness_availability::{
 };
 use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
 use crate::appearance::Appearance;
+use crate::server::experiments::{ServerExperiments, ServerExperimentsEvent};
 use crate::server::server_api::ServerApiProvider;
 use crate::ui_components::blended_colors;
 use crate::workspace::WorkspaceAction;
-use crate::BlocklistAIHistoryModel;
 
 /// True when the mode is remote and `environment_id` is non-empty.
 fn env_presence(execution_mode: &RunAgentsExecutionMode) -> bool {
@@ -203,37 +203,47 @@ impl OrchestrationConfigBlockView {
                     conversation_id: cid,
                     ..
                 } = event
+                    && *cid == me.conversation_id
                 {
-                    if *cid == me.conversation_id {
-                        me.refresh_from_model(ctx);
-                    }
+                    me.refresh_from_model(ctx);
                 }
             },
         );
+        ctx.subscribe_to_model(&ServerExperiments::handle(ctx), |me, _, event, ctx| {
+            let ServerExperimentsEvent::ExperimentsUpdated = event;
+            if !oc::runner_controls_enabled(ctx) {
+                me.pickers.runner_picker = None;
+                me.runners.clear();
+                me.runners_loading = false;
+            } else {
+                me.ensure_runner_picker(ctx);
+            }
+            ctx.notify();
+        });
 
         // Repopulate the model picker when available LLMs change (Oz
         // harness only — non-Oz harnesses get their catalog from
         // HarnessAvailabilityModel, not LLMPreferences).
         ctx.subscribe_to_model(&LLMPreferences::handle(ctx), |me, _, event, ctx| {
-            if let LLMPreferencesEvent::UpdatedAvailableLLMs = event {
-                if let Some(handle) = &me.pickers.model_picker {
-                    let is_local = !me
-                        .orchestration_edit_state
+            if let LLMPreferencesEvent::UpdatedAvailableLLMs = event
+                && let Some(handle) = &me.pickers.model_picker
+            {
+                let is_local = !me
+                    .orchestration_edit_state
+                    .orchestration_config_state
+                    .execution_mode
+                    .is_remote();
+                oc::populate_model_picker_for_harness(
+                    handle,
+                    &me.orchestration_edit_state
                         .orchestration_config_state
-                        .execution_mode
-                        .is_remote();
-                    oc::populate_model_picker_for_harness(
-                        handle,
-                        &me.orchestration_edit_state
-                            .orchestration_config_state
-                            .model_id,
-                        &me.orchestration_edit_state
-                            .orchestration_config_state
-                            .harness_type,
-                        is_local,
-                        ctx,
-                    );
-                }
+                        .model_id,
+                    &me.orchestration_edit_state
+                        .orchestration_config_state
+                        .harness_type,
+                    is_local,
+                    ctx,
+                );
             }
         });
 
@@ -408,24 +418,24 @@ impl OrchestrationConfigBlockView {
             return;
         }
         let history = BlocklistAIHistoryModel::as_ref(ctx);
-        if let Some(conv) = history.conversation(&self.conversation_id) {
-            if let Some((config, status)) = conv.orchestration_config_for_plan(&self.plan_id) {
-                self.orchestration_edit_state.orchestration_config_state =
-                    OrchestrationConfigState::from_orchestration_config(config);
-                self.is_approved = status.is_approved();
-                if self.pickers_initialized {
-                    oc::repopulate_all_pickers(
-                        &mut self.orchestration_edit_state.orchestration_config_state,
-                        &self.pickers,
-                        ctx,
-                    );
-                    // Runner picker is excluded from the shared sync (its
-                    // options are fetched async and cached on the view), so
-                    // re-apply its selection from the refreshed config.
-                    self.resync_runner_selection(ctx);
-                }
-                ctx.notify();
+        if let Some(conv) = history.conversation(&self.conversation_id)
+            && let Some((config, status)) = conv.orchestration_config_for_plan(&self.plan_id)
+        {
+            self.orchestration_edit_state.orchestration_config_state =
+                OrchestrationConfigState::from_orchestration_config(config);
+            self.is_approved = status.is_approved();
+            if self.pickers_initialized {
+                oc::repopulate_all_pickers(
+                    &mut self.orchestration_edit_state.orchestration_config_state,
+                    &self.pickers,
+                    ctx,
+                );
+                // Runner picker is excluded from the shared sync (its
+                // options are fetched async and cached on the view), so
+                // re-apply its selection from the refreshed config.
+                self.resync_runner_selection(ctx);
             }
+            ctx.notify();
         }
     }
 
@@ -518,13 +528,11 @@ impl OrchestrationConfigBlockView {
                 .set_worker_host(default_host);
             filled_defaults = true;
         }
-        if needs_env {
-            if let Some(default_env) = oc::resolve_default_environment_id(ctx) {
-                self.orchestration_edit_state
-                    .orchestration_config_state
-                    .set_environment_id(default_env);
-                filled_defaults = true;
-            }
+        if needs_env && let Some(default_env) = oc::resolve_default_environment_id(ctx) {
+            self.orchestration_edit_state
+                .orchestration_config_state
+                .set_environment_id(default_env);
+            filled_defaults = true;
         }
         if filled_defaults && self.is_approved {
             self.apply_field_change(ctx);
@@ -657,12 +665,13 @@ impl OrchestrationConfigBlockView {
     }
 
     /// Builds the Runner picker and kicks off the `getRunners` fetch, but
-    /// only when the `CloudAgentRunners` feature is enabled and the config
+    /// only when the `CloudAgentRunners` feature is enabled and the macOS
+    /// runner experiment is active, and the config
     /// is in remote mode — otherwise the Runner control is not rendered, so
     /// there is no reason to create the picker or hit `getRunners`.
     /// Idempotent, and re-invoked on the Local→Cloud toggle.
     fn ensure_runner_picker(&mut self, ctx: &mut ViewContext<Self>) {
-        if !FeatureFlag::CloudAgentRunners.is_enabled() {
+        if !oc::runner_controls_enabled(ctx) {
             return;
         }
         if !self
@@ -889,6 +898,7 @@ impl View for OrchestrationConfigBlockView {
                     &self.pickers,
                     appearance,
                     true,
+                    oc::runner_controls_enabled(app),
                 ));
 
                 // Helper text
