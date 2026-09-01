@@ -87,6 +87,7 @@ mod common;
 mod config_file;
 pub(crate) mod driver;
 mod environment;
+pub(crate) mod environment_snapshot;
 mod federate;
 mod harness_support;
 #[cfg(not(target_family = "wasm"))]
@@ -854,9 +855,13 @@ impl AgentDriverRunner {
         ))
         .await?
         .token;
-        ai_client
-            .get_task_git_credentials(task_id_str, workload_token)
-            .await
+        // Bootstrap has no prior credential store, so a one-host success would
+        // leave the other host unauthenticated for the first clone. Partial
+        // refresh is reserved for later cycles after stores exist.
+        let response = ai_client
+            .get_task_git_credentials(task_id_str, workload_token, false)
+            .await?;
+        driver::git_credentials::credentials_for_bootstrap(response)
     }
 
     async fn bootstrap_git_credentials_for_task(
@@ -1053,11 +1058,14 @@ impl AgentDriverRunner {
                     parent_run_id: None,
                     should_share,
                     idle_on_complete: args.idle_on_complete.map(|d| d.into()),
+                    idle_on_fail: args.idle_on_fail.map(|d| d.into()),
                     secrets: Default::default(),
                     resume: None,
                     cloud_providers: Vec::new(),
                     environment: None,
                     additional_source_repos: Vec::new(),
+                    repository_head_overrides: args.repository_head_overrides.clone(),
+                    remove_repository_origins: args.remove_repository_origins,
                     selected_harness: args.harness,
                     third_party_harness_model_config,
                     snapshot_disabled: args.snapshot.no_snapshot.then_some(true),
@@ -1069,6 +1077,7 @@ impl AgentDriverRunner {
                         .snapshot
                         .snapshot_script_timeout
                         .map(|duration| duration.into()),
+                    checkpoint_interval: None,
                     skip_initial_turn: args.skip_initial_turn,
                     strict_mcp_startup: args.strict_mcp_startup,
                     mcp_startup_timeout: args.mcp_startup_timeout.map(|duration| duration.into()),
@@ -1126,6 +1135,17 @@ impl AgentDriverRunner {
                 Self::resolve_environment(foreground, environment_id, &mut driver_options),
             )
             .await?;
+        driver::environment::validate_repository_head_overrides(
+            &driver::environment::merge_repos_deduped(
+                driver_options
+                    .environment
+                    .as_ref()
+                    .map(crate::ai::cloud_environments::AmbientAgentEnvironment::effective_repos)
+                    .unwrap_or_default(),
+                driver_options.additional_source_repos.clone(),
+            )?,
+            &driver_options.repository_head_overrides,
+        )?;
 
         Ok((driver_options, task, task_conversation_id))
     }
@@ -1229,7 +1249,7 @@ impl AgentDriverRunner {
         };
 
         // Handoff snapshot attachments for follow-up executions are written to
-        // {attachments_dir}/handoff/{uuid} so the server-side rehydration prompt
+        // {attachments_dir}/handoff/{filename} so the server-side rehydration prompt
         // references resolve to real files.
         let handoff_snapshot_ai_client = ai_client.clone();
         let handoff_snapshot_server_api = server_api.clone();
@@ -1513,7 +1533,9 @@ impl AgentDriverRunner {
             }
             let span =
                 tracing::info_span!("AgentDriver::run", tags.cloud_agent = true, ?task.model, ?task.harness);
-            let agent_future = driver.run(task, ctx).instrument(span);
+            let agent_future = span
+                .in_scope(|| driver.run(task, ctx))
+                .instrument(span);
 
             ctx.spawn(agent_future, |_, result, ctx| match result {
                 Ok(()) => {
@@ -1524,6 +1546,23 @@ impl AgentDriverRunner {
                 }
             });
         });
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CommandAuthentication {
+    PendingApiKey(String),
+    RefreshUser,
+}
+
+fn command_authentication(
+    pending_api_key: Option<String>,
+    is_logged_in: bool,
+) -> Option<CommandAuthentication> {
+    match pending_api_key {
+        Some(api_key) => Some(CommandAuthentication::PendingApiKey(api_key)),
+        None if is_logged_in => Some(CommandAuthentication::RefreshUser),
+        None => None,
     }
 }
 
@@ -1583,13 +1622,14 @@ fn command_requires_auth(command: &CliCommand) -> bool {
 /// Launch a CLI command, checking authentication first if needed.
 ///
 /// If auth is not required, dispatches the command immediately.
-/// If auth is required and the user is logged in, triggers a user refresh
-/// before launching the command.
+/// If auth is required, validates an explicit API key or refreshes persisted
+/// credentials before launching the command.
 fn launch_command(
     ctx: &mut AppContext,
     command: CliCommand,
     global_options: GlobalOptions,
 ) -> anyhow::Result<()> {
+    let parent_span = tracing::Span::current();
     let requires_auth = command_requires_auth(&command);
 
     if !requires_auth {
@@ -1599,22 +1639,26 @@ fn launch_command(
     let cli_name = warp_cli::binary_name().unwrap_or_else(|| "warp".to_string());
 
     let auth_state = AuthStateProvider::handle(ctx).as_ref(ctx).get();
-    if !auth_state.is_logged_in() {
+    let Some(authentication) =
+        command_authentication(global_options.api_key.clone(), auth_state.is_logged_in())
+    else {
         return Err(anyhow::anyhow!(
             "You are not logged in - please log in with `{cli_name} login` to continue."
         ));
-    }
+    };
 
     // On staging the warp-server is fronted by IAP, so establish an IAP token
     // before *any* warp-server request.
     let iap = IapManager::handle(ctx);
     if !iap.as_ref(ctx).is_enabled() || iap.as_ref(ctx).has_valid_token() {
-        refresh_auth_and_dispatch(ctx, command, global_options);
+        authenticate_and_dispatch(ctx, command, global_options, authentication, parent_span);
         return Ok(());
     }
 
     let mut handled = false;
+    let parent_span_for_iap = parent_span.clone();
     ctx.subscribe_to_model(&iap, move |_, event, ctx| {
+        let _guard = parent_span_for_iap.enter();
         if handled {
             return;
         }
@@ -1623,7 +1667,13 @@ fn launch_command(
                 if IapManager::handle(ctx).as_ref(ctx).has_valid_token() =>
             {
                 handled = true;
-                refresh_auth_and_dispatch(ctx, command.clone(), global_options.clone());
+                authenticate_and_dispatch(
+                    ctx,
+                    command.clone(),
+                    global_options.clone(),
+                    authentication.clone(),
+                    parent_span.clone(),
+                );
             }
             IapManagerEvent::AccessUnavailable => {
                 handled = true;
@@ -1641,20 +1691,21 @@ fn launch_command(
     Ok(())
 }
 
-/// Subscribes to auth events, triggers a user refresh, and dispatches the
-/// command once auth completes. Assumes IAP access (if applicable) is already
-/// established, since the auth refresh is itself an IAP-gated warp-server request.
-fn refresh_auth_and_dispatch(
+/// Subscribes to auth events, authenticates, and dispatches the command once
+/// auth completes. Assumes IAP access (if applicable) is already established.
+fn authenticate_and_dispatch(
     ctx: &mut AppContext,
     command: CliCommand,
     global_options: GlobalOptions,
+    authentication: CommandAuthentication,
+    parent_span: tracing::Span,
 ) {
     let cli_name = warp_cli::binary_name().unwrap_or_else(|| "warp".to_string());
 
-    // User is logged in — subscribe to auth events, trigger a refresh, and wait
-    // for the result before running the command.
+    // Subscribe to auth events and wait for validation before running the command.
     let mut dispatched = false;
     ctx.subscribe_to_model(&AuthManager::handle(ctx), move |_, event, ctx| {
+        let _guard = parent_span.enter();
         if dispatched {
             return;
         }
@@ -1683,9 +1734,12 @@ fn refresh_auth_and_dispatch(
         }
     });
 
-    // Trigger the user refresh - the subscription above will handle the result.
-    AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
-        auth_manager.refresh_user(ctx);
+    // Trigger authentication - the subscription above will handle the result.
+    AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| match authentication {
+        CommandAuthentication::PendingApiKey(api_key) => {
+            auth_manager.authenticate_api_key(api_key, ctx);
+        }
+        CommandAuthentication::RefreshUser => auth_manager.refresh_user(ctx),
     });
 }
 

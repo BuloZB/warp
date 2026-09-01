@@ -1290,6 +1290,9 @@ impl Input {
             | SlashCommandKind::Statusline
             | SlashCommandKind::ResetStatusline
             | SlashCommandKind::ApiKeys
+            | SlashCommandKind::ConnectGrok
+            | SlashCommandKind::Upgrade
+            | SlashCommandKind::ManageBilling
             | SlashCommandKind::ViewLogs
             | SlashCommandKind::Voice
             | SlashCommandKind::NaturalLanguageDetection
@@ -1298,6 +1301,7 @@ impl Input {
             | SlashCommandKind::Exit
             | SlashCommandKind::Logout
             | SlashCommandKind::Clear
+            | SlashCommandKind::Team
             | SlashCommandKind::Status => {
                 debug_assert!(
                     false,

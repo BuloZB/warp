@@ -2,6 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ai::api_keys::{
+    ApiKeyManager, CustomEndpoint, CustomEndpointDefinitions, CustomEndpointModel,
+    CustomEndpointSchema,
+};
 use channel_versions::{Changelog, MarkdownSection, Section};
 use chrono::DateTime;
 use uuid::Uuid;
@@ -19,10 +23,12 @@ use warpui_core::elements::tui::{
 use warpui_core::{App, AppContext};
 
 use super::{
-    ANIMATION_PANEL_COLS, LEFT_COLUMN_COLS, ZeroStateSectionVisibility, build_zero_state_layout,
-    build_zero_state_overlay, build_zero_state_stack_layout, changelog_bullets_from_changelog,
-    mcp_status_label, render_first_run_top_section,
+    ANIMATION_PANEL_COLS, LEFT_COLUMN_COLS, ZeroStateSectionVisibility, autoupdate_status_label,
+    build_zero_state_layout, build_zero_state_overlay, build_zero_state_stack_layout,
+    changelog_bullets_from_changelog, custom_endpoint_status_label, mcp_status_label,
+    render_bottom_section, render_first_run_top_section,
 };
+use crate::autoupdate::TuiAutoupdateStatus;
 use crate::tui_builder::TuiUiBuilder;
 use crate::zero_state_animation::{
     WarpLogoStyles, ZeroStateAnimationConfig, ZeroStateAnimationElement,
@@ -62,6 +68,27 @@ fn changelog(tui_updates: Vec<&str>) -> Changelog {
     }
 }
 
+fn endpoint_definitions() -> CustomEndpointDefinitions {
+    let endpoints = ["One", "Two"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| CustomEndpoint {
+            name: name.to_owned(),
+            url: format!("https://endpoint-{index}.example.com/v1"),
+            api_key: String::new(),
+            schema: CustomEndpointSchema::default(),
+            models: vec![CustomEndpointModel {
+                name: format!("model-{index}"),
+                alias: None,
+                config_key: format!("config-{index}"),
+            }],
+        })
+        .collect::<Vec<_>>();
+    CustomEndpointDefinitions::from_legacy(&endpoints)
+        .expect("test endpoints should be valid")
+        .0
+}
+
 #[test]
 fn changelog_bullets_use_only_the_first_three_tui_updates() {
     let changelog = changelog(vec!["First", "Second", "Third", "Fourth"]);
@@ -74,6 +101,22 @@ fn changelog_bullets_use_only_the_first_three_tui_updates() {
 #[test]
 fn changelog_bullets_are_empty_when_only_other_surfaces_have_updates() {
     assert!(changelog_bullets_from_changelog(&changelog(Vec::new())).is_empty());
+}
+
+#[test]
+fn failed_autoupdate_status_has_visible_label() {
+    assert_eq!(
+        autoupdate_status_label(TuiAutoupdateStatus::Failed),
+        Some("automatic update failed")
+    );
+}
+
+#[test]
+fn homebrew_update_status_shows_the_upgrade_command() {
+    assert_eq!(
+        autoupdate_status_label(TuiAutoupdateStatus::UpdateAvailable),
+        Some("update available — run brew upgrade --cask warp-agent-cli")
+    );
 }
 
 #[test]
@@ -95,18 +138,28 @@ fn first_zero_state_matches_welcome_design_copy() {
         for expected in [
             "Welcome to Warp",
             "What’s different about Warp",
-            "✶ /natural-language-detection",
-            "to autodetect",
-            "prompts or shell commands",
-            "✶ /modify-settings to set up custom model",
-            "routers",
-            "✶ /orchestrate to spawn fleets of agents",
-            "✶ Run full-screen terminal apps and cd into",
-            "other directories",
+            "✶ State of the art coding agents",
+            "✶ Frontier and open-weight models",
+            "✶ Fully customizable model routers",
+            "✶ Orchestration for fleets of agents",
+            "✶ Better shell command support",
         ] {
             assert!(
                 rendered.contains(expected),
                 "first zero state should contain {expected:?}:\n{rendered}"
+            );
+        }
+        for unexpected in [
+            "/natural-language-detection",
+            "/modify-settings",
+            "/orchestrate",
+            "Run full-screen terminal apps",
+            "Orchestrate fleets of agents",
+            "Work with shell commands like in a native terminal",
+        ] {
+            assert!(
+                !rendered.contains(unexpected),
+                "first zero state should not contain {unexpected:?}:\n{rendered}"
             );
         }
         assert!(!rendered.contains("What's new"));
@@ -179,6 +232,120 @@ fn mcp_summary_marks_config_errors() {
         mcp_status_label(&snapshot),
         ("2 config errors · /mcp".to_string(), true)
     );
+}
+
+#[test]
+fn custom_endpoint_summary_tracks_configuration_and_local_keys() {
+    App::test((), |mut app| async move {
+        register_tui_session_view_test_singletons(&mut app);
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                None
+            );
+        });
+
+        let definitions = endpoint_definitions();
+        let first = definitions.id_at(0).unwrap().clone();
+        let second = definitions.id_at(1).unwrap().clone();
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_custom_endpoint_definitions(definitions, ctx);
+        });
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                Some(("2 need API keys · /api-keys".to_owned(), false))
+            );
+        });
+
+        ApiKeyManager::handle(&app)
+            .update(&mut app, |manager, ctx| {
+                manager.persist_custom_endpoint_key(first, Some("first-secret".to_owned()), ctx)
+            })
+            .unwrap();
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                Some((
+                    "1 connected · 1 need API keys · /api-keys".to_owned(),
+                    false
+                ))
+            );
+        });
+
+        ApiKeyManager::handle(&app)
+            .update(&mut app, |manager, ctx| {
+                manager.persist_custom_endpoint_key(second, Some("second-secret".to_owned()), ctx)
+            })
+            .unwrap();
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                Some(("2 connected · /api-keys".to_owned(), false))
+            );
+        });
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.invalidate_custom_endpoint_definitions(ctx);
+        });
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                Some((
+                    "Configuration error · fix agents.custom_endpoints".to_owned(),
+                    true
+                ))
+            );
+        });
+    });
+}
+
+#[test]
+fn custom_endpoint_section_is_hidden_until_an_endpoint_is_configured() {
+    App::test((), |mut app| async move {
+        register_tui_session_view_test_singletons(&mut app);
+        app.read(|ctx| {
+            let builder = TuiUiBuilder::from_app(ctx);
+            let rendered = render_element_lines(
+                render_bottom_section(
+                    None,
+                    None,
+                    ZeroStateSectionVisibility::default(),
+                    &builder,
+                    ctx,
+                )
+                .finish(),
+                ctx,
+                LEFT_COLUMN_COLS,
+                20,
+            )
+            .join("\n");
+            assert!(!rendered.contains("Custom endpoints"));
+        });
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_custom_endpoint_definitions(endpoint_definitions(), ctx);
+        });
+        app.read(|ctx| {
+            let builder = TuiUiBuilder::from_app(ctx);
+            let rendered = render_element_lines(
+                render_bottom_section(
+                    None,
+                    None,
+                    ZeroStateSectionVisibility::default(),
+                    &builder,
+                    ctx,
+                )
+                .finish(),
+                ctx,
+                LEFT_COLUMN_COLS,
+                20,
+            )
+            .join("\n");
+            assert!(rendered.contains("Custom endpoints"));
+            assert!(rendered.contains("2 need API keys · /api-keys"));
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------

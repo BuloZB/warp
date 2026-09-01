@@ -6,24 +6,26 @@
 //! allowing authentication to complete in the background.
 
 use std::io::{self, IsTerminal as _, Read as _};
+use std::path::PathBuf;
 
 use ai::LLMProvider;
 use ai::api_keys::ApiKeyManager;
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
 use clap::error::ErrorKind;
+use clap::{Parser, Subcommand};
 use inquire::{InquireError, Password, PasswordDisplayMode};
-use warp::settings::TuiThemeSettings;
+use warp::settings::{TuiThemeSettings, TuiZeroStateSettings, TuiZeroStateSettingsChangedEvent};
 #[cfg(feature = "voice_input")]
 use warp::settings::{TuiVoiceSettings, TuiVoiceSettingsChangedEvent};
 use warp::tui_export::{AIConversationAutoexecuteMode, Appearance, ServerConversationToken};
 use warp::{TuiLoginEvent, TuiLoginModel, TuiLoginPhase};
 use warp_core::channel::ChannelState;
+use warp_core::settings::Setting as _;
 use warp_core::telemetry::TelemetryEvent as _;
 use warp_errors::report_error;
 use warpui::SingletonEntity as _;
 use warpui_core::platform::{TerminationMode, WindowStyle};
-use warpui_core::runtime::spawn_tui_driver;
+use warpui_core::runtime::{TuiDriverStartupError, TuiFocusPolicy, spawn_tui_driver};
 use warpui_core::{AddWindowOptions, AppContext, ModelHandle, ViewHandle};
 
 use crate::clipboard::copy_to_clipboard;
@@ -32,7 +34,7 @@ use crate::resume::TuiExitSummaryHandle;
 use crate::root_view::RootTuiView;
 use crate::session_registry::{TuiSessions, TuiSessionsEvent};
 use crate::telemetry::TuiStartupTelemetryEvent;
-use crate::terminal_background::TuiHostTerminalBackground;
+use crate::terminal_background::probe_and_select_theme;
 use crate::terminal_session_view::{
     TuiConversationRestoreOrigin, TuiConversationRestoreTarget, tui_resume_shell_command,
 };
@@ -49,6 +51,9 @@ const CLI_VERSION: &str = match option_env!("GIT_RELEASE_TAG") {
 #[derive(Debug, Parser)]
 #[command(name = "warp", version = CLI_VERSION)]
 struct TuiArgs {
+    #[command(subcommand)]
+    command: Option<TuiCommand>,
+
     /// Resume an Oz/Warp conversation by server token.
     #[arg(long)]
     resume: Option<String>,
@@ -87,6 +92,20 @@ enum ProviderApiKeyCommand {
     },
     Clear {
         provider: LLMProvider,
+    },
+}
+
+/// One-shot commands available on the standalone TUI binaries. The full app
+/// binary implements the same `dump-settings-schema` contract (see
+/// `warp_cli::Command::DumpSettingsSchema`); this local copy lets
+/// `script/run-tui` seed a real settings schema from whichever TUI binary is
+/// about to run, without building the full GUI app binary just for that.
+#[derive(Debug, Subcommand)]
+enum TuiCommand {
+    /// Print the JSON schema for the current Warp channel's settings and exit.
+    DumpSettingsSchema {
+        /// Write the schema to this path instead of standard output.
+        output_path: Option<PathBuf>,
     },
 }
 
@@ -143,6 +162,10 @@ pub fn run() -> Result<()> {
         }
         Err(error) => return Err(anyhow::Error::new(error)),
     };
+    if let Some(TuiCommand::DumpSettingsSchema { output_path }) = args.command {
+        warp::features::init_feature_flags();
+        return warp::settings::dump_settings_schema(output_path.as_deref());
+    }
     let provider_api_key_command = if let Some(provider) = args.set_provider_api_key {
         if !provider.supports_pasted_api_key() {
             return Err(anyhow!(
@@ -241,7 +264,7 @@ fn init(
     // Appearance theme at mount time, without changing normal GUI theme
     // selection or font settings.
     let selected_theme = TuiThemeSettings::as_ref(ctx).selected_theme();
-    let (theme, probe) = TuiHostTerminalBackground::register(selected_theme, ctx);
+    let theme = probe_and_select_theme(selected_theme);
     Appearance::handle(ctx).update(ctx, |appearance, ctx| {
         appearance.set_theme(theme, ctx);
     });
@@ -251,23 +274,45 @@ fn init(
             window_style: WindowStyle::NotStealFocus,
             ..Default::default()
         },
-        |_| RootTuiView::new(),
+        RootTuiView::new,
     );
     #[cfg(feature = "voice_input")]
     let modifier_key_lifecycle_enabled = requires_modifier_key_reporting(ctx);
     #[cfg(not(feature = "voice_input"))]
     let modifier_key_lifecycle_enabled = false;
+    let freeze_repaints_when_unfocused = *TuiZeroStateSettings::as_ref(ctx)
+        .freeze_animation_when_unfocused
+        .value();
     match spawn_tui_driver(
         ctx,
         window_id,
         root.clone(),
+        TuiFocusPolicy::PresentedTree,
         modifier_key_lifecycle_enabled,
-        Some(probe),
+        freeze_repaints_when_unfocused,
     ) {
         Ok(driver) => {
             let sessions = ctx.add_singleton_model(|_| {
                 TuiSessions::new(driver, exit_summary, resume_token, default_autoexecute_mode)
             });
+            let sessions_for_zero_state_settings = sessions.clone();
+            ctx.subscribe_to_model(
+                &TuiZeroStateSettings::handle(ctx),
+                move |settings, event, ctx| {
+                    let TuiZeroStateSettingsChangedEvent::TuiZeroStateFreezeAnimationWhenUnfocusedSetting {
+                        ..
+                    } = event
+                    else {
+                        return;
+                    };
+                    let freeze =
+                        *settings.as_ref(ctx).freeze_animation_when_unfocused.value();
+                    sessions_for_zero_state_settings.update(ctx, |sessions, _| {
+                        sessions.set_freeze_repaints_when_unfocused(freeze);
+                    });
+                    ctx.invalidate_all_views();
+                },
+            );
             #[cfg(feature = "voice_input")]
             let sessions_for_voice_settings = sessions.clone();
             #[cfg(feature = "voice_input")]
@@ -314,7 +359,17 @@ fn init(
                 ensure_terminal_session(&sessions, &root, ctx);
             }
         }
-        Err(error) => {
+        Err(error) => handle_tui_driver_startup_error(error, ctx),
+    }
+}
+
+fn handle_tui_driver_startup_error(error: TuiDriverStartupError, ctx: &mut AppContext) {
+    match error {
+        TuiDriverStartupError::TerminalDisconnected(error) => {
+            log::error!("failed to start the TUI driver: {error}");
+            ctx.terminate_app(TerminationMode::ForceTerminate, None);
+        }
+        TuiDriverStartupError::Unexpected(error) => {
             let error = anyhow::Error::new(error);
             report_error!(&error);
             ctx.terminate_app(TerminationMode::ForceTerminate, Some(Err(error)));
@@ -356,6 +411,7 @@ fn ensure_terminal_session(
         });
     }
     root.update(ctx, |root, ctx| root.show_terminal(ctx));
+    TuiLoginModel::record_terminal_shown(ctx);
 }
 
 #[cfg(test)]

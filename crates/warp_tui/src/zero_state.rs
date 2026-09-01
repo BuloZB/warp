@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent};
 use ai::project_context::model::{
     ProjectContextModel, ProjectContextModelEvent, ProjectRulesResult,
 };
@@ -33,9 +34,11 @@ use warpui_core::elements::tui::{
 };
 use warpui_core::{AppContext, Entity, ModelHandle, TuiView, ViewContext};
 
-use crate::autoupdate::{TuiAutoupdateStatus, TuiAutoupdater, TuiAutoupdaterEvent};
+use crate::autoupdate::{
+    HOMEBREW_UPDATE_STATUS, TuiAutoupdateStatus, TuiAutoupdater, TuiAutoupdaterEvent,
+};
 use crate::tui_builder::TuiUiBuilder;
-use crate::ui::abbreviate_home_prefix;
+use crate::ui::{abbreviate_home_prefix, append_welcome_capability_section, render_welcome_title};
 use crate::zero_state_animation::{
     WarpLogoStyles, ZeroStateAnimationConfig, ZeroStateAnimationConfigEvent,
     ZeroStateAnimationElement, ZeroStateInteractionHandle, ZeroStateStarfieldElement,
@@ -150,6 +153,10 @@ impl TuiZeroStateView {
             |_, _, SkillManagerEvent::SkillsChanged { .. }, ctx| ctx.notify(),
         );
         ctx.subscribe_to_model(&TuiMcpManager::handle(ctx), |_, _, _, ctx| ctx.notify());
+        ctx.subscribe_to_model(
+            &ApiKeyManager::handle(ctx),
+            |_, _, _: &ApiKeyManagerEvent, ctx| ctx.notify(),
+        );
         ctx.subscribe_to_model(&TuiUserInfoManager::handle(ctx), |_, _, event, ctx| {
             let TuiUserInfoManagerEvent::Updated = event;
             ctx.notify();
@@ -196,6 +203,9 @@ impl TuiZeroStateView {
                         ..
                     }
                     | TuiZeroStateSettingsChangedEvent::TuiZeroStateExtrusionDepthSetting {
+                        ..
+                    }
+                    | TuiZeroStateSettingsChangedEvent::TuiZeroStateFreezeAnimationWhenUnfocusedSetting {
                         ..
                     } => {}
                 }
@@ -599,17 +609,14 @@ fn build_zero_state_overlay_with_variant(
         column = column.child(blank_row()).child(path_header);
     }
 
-    if project_cwd.is_some() || visibility.mcp {
-        let rules_ref = project_rules.flatten();
-        let constrained_bottom = TuiConstrainedBox::new(
-            render_bottom_section(project_cwd, rules_ref.as_ref(), visibility, builder, ctx)
-                .finish(),
-        )
-        .with_min_cols(LEFT_COLUMN_COLS)
-        .with_max_cols(LEFT_COLUMN_COLS)
-        .finish();
-        column = column.child(constrained_bottom);
-    }
+    let rules_ref = project_rules.flatten();
+    let constrained_bottom = TuiConstrainedBox::new(
+        render_bottom_section(project_cwd, rules_ref.as_ref(), visibility, builder, ctx).finish(),
+    )
+    .with_min_cols(LEFT_COLUMN_COLS)
+    .with_max_cols(LEFT_COLUMN_COLS)
+    .finish();
+    column = column.child(constrained_bottom);
 
     column.finish()
 }
@@ -683,55 +690,15 @@ fn render_first_run_top_section(
     visibility: ZeroStateSectionVisibility,
     app: &AppContext,
 ) -> TuiFlex {
-    let title_style = builder.accent_text_style().add_modifier(Modifier::BOLD);
-    let muted = builder.muted_text_style();
     let mut column = TuiFlex::column()
-        .child(
-            TuiText::new("Welcome to Warp")
-                .with_style(title_style)
-                .truncate()
-                .finish(),
-        )
+        .child(render_welcome_title(builder))
         .child(render_version_line(builder, app));
     if visibility.signed_in_user {
         column = column.child(render_login_line_with_prefix("logged in as", builder, app));
     }
-    column = column.child(blank_row()).child(blank_row()).child(
-        TuiText::new("What’s different about Warp")
-            .with_style(muted)
-            .truncate()
-            .finish(),
-    );
-    for (command, description) in [
-        (
-            Some("/natural-language-detection"),
-            "to autodetect prompts or shell commands",
-        ),
-        (Some("/modify-settings"), "to set up custom model routers"),
-        (Some("/orchestrate"), "to spawn fleets of agents"),
-        (
-            None,
-            "Run full-screen terminal apps and cd into other directories",
-        ),
-    ] {
-        column = column.child(render_first_run_capability(command, description, builder));
-    }
+    column = column.child(blank_row()).child(blank_row());
+    column = append_welcome_capability_section(column, builder);
     column.child(blank_row())
-}
-
-fn render_first_run_capability(
-    command: Option<&str>,
-    description: &str,
-    builder: &TuiUiBuilder,
-) -> Box<dyn TuiElement> {
-    let highlight = builder.success_glyph_style();
-    let primary = builder.primary_text_style();
-    let mut spans = vec![("✶ ".to_owned(), highlight)];
-    if let Some(command) = command {
-        spans.push((format!("{command} "), highlight));
-    }
-    spans.push((description.to_owned(), primary));
-    TuiText::from_spans(spans).finish()
 }
 
 /// Bottom section of the overlay column: project context body (rules / skills / placeholder)
@@ -756,9 +723,9 @@ fn render_bottom_section(
         column
     };
     if visibility.mcp {
-        render_mcp_section(column, builder, app)
+        render_custom_endpoints_section(render_mcp_section(column, builder, app), builder, app)
     } else {
-        column
+        render_custom_endpoints_section(column, builder, app)
     }
 }
 
@@ -795,6 +762,57 @@ fn render_mcp_section(mut column: TuiFlex, builder: &TuiUiBuilder, app: &AppCont
         muted
     };
     column.child(TuiText::new(label).with_style(style).truncate().finish())
+}
+
+fn render_custom_endpoints_section(
+    column: TuiFlex,
+    builder: &TuiUiBuilder,
+    app: &AppContext,
+) -> TuiFlex {
+    let Some((label, is_error)) = custom_endpoint_status_label(ApiKeyManager::as_ref(app)) else {
+        return column;
+    };
+    let header_style = builder.primary_text_style().add_modifier(Modifier::BOLD);
+    let style = if is_error {
+        builder.error_text_style()
+    } else {
+        builder.muted_text_style()
+    };
+    column
+        .child(blank_row())
+        .child(
+            TuiText::new("Custom endpoints")
+                .with_style(header_style)
+                .truncate()
+                .finish(),
+        )
+        .child(TuiText::new(label).with_style(style).truncate().finish())
+}
+
+fn custom_endpoint_status_label(manager: &ApiKeyManager) -> Option<(String, bool)> {
+    if !manager.custom_endpoint_settings_valid() {
+        return Some((
+            "Configuration error · fix agents.custom_endpoints".to_owned(),
+            true,
+        ));
+    }
+    let definitions = manager.custom_endpoint_definitions()?;
+    if definitions.is_empty() {
+        return None;
+    }
+    let connected = definitions
+        .definitions()
+        .filter(|(id, _)| manager.custom_endpoint_key(id).is_some())
+        .count();
+    let missing = definitions.len() - connected;
+    let label = match (connected, missing) {
+        (0, missing) => format!("{missing} need API keys · /api-keys"),
+        (connected, 0) => format!("{connected} connected · /api-keys"),
+        (connected, missing) => {
+            format!("{connected} connected · {missing} need API keys · /api-keys")
+        }
+    };
+    Some((label, false))
 }
 #[derive(Default)]
 struct McpStatusCounts {
@@ -905,6 +923,19 @@ fn login_line_label(signed_in_prefix: &str, user_info: TuiUserInfoSnapshot) -> O
         .map(|display| format!("{signed_in_prefix} {display}"))
 }
 
+/// User-facing copy for each visible background updater status.
+fn autoupdate_status_label(status: TuiAutoupdateStatus) -> Option<&'static str> {
+    match status {
+        TuiAutoupdateStatus::Idle => None,
+        TuiAutoupdateStatus::Checking => Some("checking for updates…"),
+        TuiAutoupdateStatus::Updating => Some("updating…"),
+        TuiAutoupdateStatus::UpToDate => Some("up to date"),
+        TuiAutoupdateStatus::Failed => Some("automatic update failed"),
+        TuiAutoupdateStatus::PendingRestart => Some("update installed, restart to apply"),
+        TuiAutoupdateStatus::UpdateAvailable => Some(HOMEBREW_UPDATE_STATUS),
+    }
+}
+
 /// The version line: the release version (or "dev build"), with the
 /// background auto-updater's status appended in parentheses. Dev builds
 /// never run the updater (and have no version), so they render plain; the
@@ -918,20 +949,18 @@ fn render_version_line(builder: &TuiUiBuilder, app: &AppContext) -> Box<dyn TuiE
             .truncate()
             .finish();
     };
-    let suffix = match TuiAutoupdater::as_ref(app).status() {
-        TuiAutoupdateStatus::Idle => None,
-        TuiAutoupdateStatus::Checking => Some(("checking for updates…", muted)),
-        TuiAutoupdateStatus::Updating => Some(("updating…", muted)),
-        TuiAutoupdateStatus::UpToDate => Some(("up to date", muted)),
-        // The one state worth drawing attention to: an update is staged and
-        // a restart picks it up.
-        TuiAutoupdateStatus::PendingRestart => Some((
-            "update installed, restart to apply",
-            builder.success_glyph_style(),
-        )),
-    };
-    let Some((label, style)) = suffix else {
+    let status = TuiAutoupdater::as_ref(app).status();
+    let Some(label) = autoupdate_status_label(status) else {
         return TuiText::new(version).with_style(muted).truncate().finish();
+    };
+    let style = match status {
+        TuiAutoupdateStatus::Idle => unreachable!("idle status has no label"),
+        TuiAutoupdateStatus::Checking
+        | TuiAutoupdateStatus::Updating
+        | TuiAutoupdateStatus::UpToDate
+        | TuiAutoupdateStatus::UpdateAvailable => muted,
+        TuiAutoupdateStatus::Failed => builder.error_text_style(),
+        TuiAutoupdateStatus::PendingRestart => builder.success_glyph_style(),
     };
     // Like the bullet rows below: the version reports its natural width and
     // the suffix wraps against the remaining column width.

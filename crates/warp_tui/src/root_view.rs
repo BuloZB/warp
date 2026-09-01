@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use warp::tui_export::{ServerId, TeamUpdateManager, UserWorkspaces};
 use warp::{TuiLoginModel, TuiLoginPhase};
+use warp_core::user_preferences::GetUserPreferences as _;
 use warpui::SingletonEntity as _;
 use warpui_core::elements::MouseStateHandle;
 use warpui_core::elements::animation::AnimationClock;
@@ -11,7 +13,10 @@ use warpui_core::elements::tui::{TuiChildView, TuiElement};
 use warpui_core::keymap::FixedBinding;
 use warpui_core::keymap::macros::*;
 use warpui_core::platform::TerminationMode;
-use warpui_core::{AppContext, Entity, EntityId, TuiView, TypedActionView, ViewContext, keymap};
+use warpui_core::{
+    AppContext, Entity, EntityId, FocusContext, TuiView, TypedActionView, ViewContext, WindowId,
+    keymap,
+};
 
 use crate::clipboard::copy_to_clipboard;
 use crate::keybindings::TUI_BINDING_GROUP;
@@ -22,6 +27,7 @@ use crate::ui::{
     login_failed, login_waiting, signed_out_welcome, terminal_starting,
 };
 use crate::zero_state_animation::ZeroStateAnimationConfig;
+const LAST_TEAM_STORAGE_KEY: &str = "TuiLastTeamUid";
 
 /// Typed actions handled by [`RootTuiView`].
 #[derive(Debug, Clone)]
@@ -71,7 +77,13 @@ pub fn init(app: &mut AppContext) {
 
 impl RootTuiView {
     /// Creates the login-gated root view.
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ctx: &mut ViewContext<Self>) -> Self {
+        let window_id = ctx.window_id();
+        let team_uid = Self::restore_last_team_uid(ctx)
+            .or_else(|| UserWorkspaces::as_ref(ctx).inherited_or_default_team_uid(None));
+        UserWorkspaces::handle(ctx).update(ctx, |user_workspaces, ctx| {
+            user_workspaces.register_window(window_id, team_uid, ctx);
+        });
         Self {
             state: RootTuiState::Auth,
             auth_animation_clock: AnimationClock::starting_at(Duration::ZERO),
@@ -85,6 +97,40 @@ impl RootTuiView {
             copy_login_url_when_available: false,
             login_copy_hint: TransientHint::default(),
         }
+    }
+
+    pub(crate) fn switch_window_to_team(
+        window_id: WindowId,
+        team_uid: ServerId,
+        ctx: &mut AppContext,
+    ) {
+        UserWorkspaces::handle(ctx).update(ctx, |user_workspaces, ctx| {
+            user_workspaces.switch_window_to_team(window_id, team_uid, ctx);
+        });
+        Self::store_last_team_uid(team_uid, ctx);
+        // Tests drive team switches without registering the update manager.
+        if ctx.has_singleton_model::<TeamUpdateManager>() {
+            TeamUpdateManager::handle(ctx).update(ctx, |manager, ctx| {
+                std::mem::drop(manager.refresh_workspace_metadata(ctx));
+            });
+        }
+    }
+
+    fn restore_last_team_uid(ctx: &AppContext) -> Option<ServerId> {
+        ctx.private_user_preferences()
+            .read_value(LAST_TEAM_STORAGE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|stored| serde_json::from_str::<ServerId>(&stored).ok())
+    }
+
+    fn store_last_team_uid(team_uid: ServerId, ctx: &AppContext) {
+        let Ok(serialized) = serde_json::to_string(&team_uid) else {
+            return;
+        };
+        let _ = ctx
+            .private_user_preferences()
+            .write_value(LAST_TEAM_STORAGE_KEY, serialized);
     }
 
     /// Transitions from the authentication gate to the live session container.
@@ -169,11 +215,14 @@ impl RootTuiView {
         }
 
         match copy(url) {
-            Ok(()) => self.login_copy_hint.show_success(
-                "Login URL copied to clipboard".to_owned(),
-                ctx,
-                |view| &mut view.login_copy_hint,
-            ),
+            Ok(()) => {
+                self.login_copy_hint.show_success(
+                    "Login URL copied to clipboard".to_owned(),
+                    ctx,
+                    |view| &mut view.login_copy_hint,
+                );
+                TuiLoginModel::record_login_url_copied(true, ctx);
+            }
             Err(error) => {
                 log::warn!("Failed to copy TUI login URL: {error}");
                 self.login_copy_hint.show_error(
@@ -181,6 +230,7 @@ impl RootTuiView {
                     ctx,
                     |view| &mut view.login_copy_hint,
                 );
+                TuiLoginModel::record_login_url_copied(false, ctx);
             }
         }
     }
@@ -205,6 +255,14 @@ impl TuiView for RootTuiView {
         }
     }
 
+    fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {
+        if focus_ctx.is_self_focused()
+            && matches!(self.state, RootTuiState::Terminal)
+            && let Some(view) = self.focused_session_view(ctx)
+        {
+            view.activate(ctx);
+        }
+    }
     fn render(&self, ctx: &AppContext) -> Box<dyn TuiElement> {
         match self.state {
             RootTuiState::Auth => match TuiLoginModel::as_ref(ctx).phase() {
@@ -316,7 +374,12 @@ impl TypedActionView for RootTuiView {
 
     fn handle_action(&mut self, action: &RootTuiAction, ctx: &mut ViewContext<Self>) {
         match action {
-            RootTuiAction::ExitApp => ctx.terminate_app(TerminationMode::ForceTerminate, None),
+            RootTuiAction::ExitApp => {
+                if matches!(self.state, RootTuiState::Auth) {
+                    TuiLoginModel::record_authentication_abandoned(ctx);
+                }
+                ctx.terminate_app(TerminationMode::ForceTerminate, None);
+            }
             RootTuiAction::StartDeviceLogin => {
                 if matches!(
                     TuiLoginModel::as_ref(ctx).phase(),
@@ -333,7 +396,7 @@ impl TypedActionView for RootTuiView {
                 ) {
                     self.reset_login_copy_state();
                     self.copy_login_url_when_available = true;
-                    TuiLoginModel::start_device_login(ctx);
+                    TuiLoginModel::start_device_login_and_copy_url(ctx);
                 }
             }
             RootTuiAction::OpenLoginUrl(url) => {
